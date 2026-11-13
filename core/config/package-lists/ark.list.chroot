@@ -1,0 +1,58 @@
+# Base
+systemd-sysv
+systemd-resolved
+libnss-resolve
+live-boot
+live-config
+ca-certificates
+openssh-server
+sudo
+tmux
+less
+vim-tiny
+htop
+jq
+zstd
+pigz
+rsync
+
+# Hardware: firmware and inspection
+firmware-linux
+firmware-iwlwifi
+firmware-realtek
+firmware-amd-graphics
+pciutils
+usbutils
+lshw
+smartmontools
+nvme-cli
+ethtool
+iw
+wpasupplicant
+
+# Storage
+btrfs-progs
+cryptsetup
+e2fsprogs
+dosfstools
+mdadm
+gdisk
+parted
+
+# Network
+iproute2
+nftables
+wireguard-tools
+avahi-daemon
+avahi-utils
+dnsmasq
+chrony
+gpsd
+tcpdump
+
+# Runtime for wizard and detection
+python3
+whiptail
+
+# Dev/firmware basics available on every node (heavier tooling comes as roles)
+python3-serial

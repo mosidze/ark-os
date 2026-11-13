@@ -1,0 +1,23 @@
+#!/bin/sh
+# live-build configuration for ARK-Core (Debian 13 "trixie", amd64).
+# Run through core/build.sh, not directly.
+set -e
+
+lb config noauto \
+    --distribution trixie \
+    --architectures amd64 \
+    --linux-flavours amd64 \
+    --archive-areas "main contrib non-free non-free-firmware" \
+    --parent-archive-areas "main contrib non-free non-free-firmware" \
+    --apt-recommends false \
+    --debian-installer none \
+    --binary-images iso-hybrid \
+    --bootloaders "grub-efi,syslinux" \
+    --iso-volume "ARK-CORE" \
+    --chroot-squashfs-compression-type xz \
+    --security true \
+    --updates true \
+    --firmware-chroot true \
+    --bootappend-live "boot=live components quiet" \
+    --memtest none \
+    "${@}"

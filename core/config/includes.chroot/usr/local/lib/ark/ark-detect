@@ -1,0 +1,247 @@
+#!/usr/bin/env python3
+"""ark-detect: collect hardware facts and derive k3s node labels.
+
+Writes <run_dir>/hw.json and <run_dir>/labels.json (default run_dir=/run/ark).
+Standard library only. Every external tool is optional: a missing tool just
+means the corresponding facts are reported as unknown/empty.
+
+Usage:
+    ark-detect            # write files, print summary
+    ark-detect --print    # print JSON to stdout, write nothing
+"""
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+
+RUN_DIR = pathlib.Path(os.environ.get("ARK_RUN_DIR", "/run/ark"))
+
+# (vendor:product) -> kind. Extend as hardware shows up.
+USB_KINDS = {
+    "0bda:2838": "sdr",  # RTL2832U (RTL-SDR)
+    "0bda:2832": "sdr",
+    "1d50:6089": "sdr",  # HackRF One
+    "1d50:60a1": "sdr",  # Airspy
+    "1df7:3000": "sdr",  # SDRplay
+    "1546:01a7": "gps",  # u-blox 7
+    "1546:01a8": "gps",  # u-blox 8
+    "067b:2303": "serial",  # Prolific PL2303 (RS-485/RS-232 adapters)
+    "0403:6001": "serial",  # FTDI FT232
+    "0403:6010": "serial",
+    "0403:6015": "serial",
+    "10c4:ea60": "serial",  # CP210x (ESP boards, LoRa modules)
+    "1a86:7523": "serial",  # CH340 (ESP, Arduino clones)
+    "303a:1001": "serial",  # Espressif native USB
+    "2341:0043": "serial",  # Arduino Uno
+    "1a40:0101": "hub",
+}
+
+PCI_GPU_CLASSES = ("0300", "0302", "0380")
+PCI_VENDORS = {"10de": "nvidia", "1002": "amd", "8086": "intel"}
+
+
+def run(cmd, timeout=10):
+    try:
+        res = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout, check=False
+        )
+        return res.stdout if res.returncode == 0 else ""
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def read(path, default=""):
+    try:
+        return pathlib.Path(path).read_text()
+    except OSError:
+        return default
+
+
+def detect_ram_gb():
+    for line in read("/proc/meminfo").splitlines():
+        if line.startswith("MemTotal:"):
+            kib = int(line.split()[1])
+            return round(kib / 1024 / 1024, 1)
+    return 0.0
+
+
+def detect_cpu():
+    model, flags, cores = "unknown", set(), os.cpu_count() or 1
+    for line in read("/proc/cpuinfo").splitlines():
+        if line.startswith("model name") and model == "unknown":
+            model = line.split(":", 1)[1].strip()
+        elif line.startswith("flags") and not flags:
+            flags = set(line.split(":", 1)[1].split())
+    return {
+        "model": model,
+        "threads": cores,
+        "avx": "avx" in flags,
+        "avx2": "avx2" in flags,
+        "avx512": "avx512f" in flags,
+        "virt": bool(flags & {"vmx", "svm"}),
+    }
+
+
+def detect_gpus():
+    gpus = []
+    for line in run(["lspci", "-nn", "-D"]).splitlines():
+        m = re.search(r"\[(03(?:00|02|80))\]: (.+?) \[([0-9a-f]{4}):([0-9a-f]{4})\]", line)
+        if not m or m.group(1) not in PCI_GPU_CLASSES:
+            continue
+        vendor = PCI_VENDORS.get(m.group(3), "other")
+        gpus.append(
+            {
+                "vendor": vendor,
+                "name": m.group(2),
+                "id": f"{m.group(3)}:{m.group(4)}",
+                "vram_gb": None,
+                "discrete": None,
+            }
+        )
+    # VRAM: AMD exposes it in sysfs, NVIDIA via nvidia-smi if the driver is loaded.
+    amd_vram = []
+    for p in sorted(pathlib.Path("/sys/class/drm").glob("card[0-9]/device/mem_info_vram_total")):
+        try:
+            amd_vram.append(round(int(p.read_text()) / 1024**3, 1))
+        except (OSError, ValueError):
+            pass
+    nv_out = run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+    nv_vram = [round(int(x) / 1024, 1) for x in nv_out.split() if x.isdigit()]
+    for g in gpus:
+        if g["vendor"] == "amd" and amd_vram:
+            g["vram_gb"] = amd_vram.pop(0)
+        elif g["vendor"] == "nvidia" and nv_vram:
+            g["vram_gb"] = nv_vram.pop(0)
+        g["discrete"] = g["vendor"] in ("nvidia",) or bool(g["vram_gb"] and g["vram_gb"] >= 2)
+    return gpus
+
+
+def detect_usb():
+    found = {"sdr": [], "gps": [], "serial": []}
+    for line in run(["lsusb"]).splitlines():
+        m = re.search(r"ID ([0-9a-f]{4}:[0-9a-f]{4}) (.*)$", line)
+        if not m:
+            continue
+        kind = USB_KINDS.get(m.group(1))
+        if kind in found:
+            found[kind].append({"id": m.group(1), "name": m.group(2).strip()})
+    tty = sorted(str(p) for p in pathlib.Path("/dev").glob("ttyUSB*")) + sorted(
+        str(p) for p in pathlib.Path("/dev").glob("ttyACM*")
+    )
+    return found, tty
+
+
+def detect_disks():
+    out = run(
+        ["lsblk", "-J", "-b", "-o", "NAME,SIZE,TYPE,ROTA,TRAN,MODEL,RM,LABEL,FSTYPE"]
+    )
+    try:
+        tree = json.loads(out).get("blockdevices", [])
+    except json.JSONDecodeError:
+        return []
+    disks = []
+    for dev in tree:
+        if dev.get("type") != "disk" or re.match(r"(zram|ram|loop|sr|fd)\d*$", dev["name"]):
+            continue
+        if int(dev.get("size") or 0) < 10**9:  # skip empty/tiny pseudo-disks
+            continue
+        labels = {c.get("label") for c in dev.get("children", []) or []}
+        is_boot = any(lbl and lbl.startswith("ARK-") and lbl != "ARK-DATA" for lbl in labels)
+        disks.append(
+            {
+                "name": dev["name"],
+                "size_gb": round(int(dev.get("size") or 0) / 1000**3, 1),
+                "rotational": bool(dev.get("rota")),
+                "transport": dev.get("tran"),
+                "model": (dev.get("model") or "").strip(),
+                "removable": bool(dev.get("rm")),
+                "boot_media": is_boot,
+                "has_ark_data": "ARK-DATA" in labels,
+            }
+        )
+    return disks
+
+
+def ram_class(gb):
+    if gb < 8:
+        return "tiny"
+    if gb < 16:
+        return "small"
+    if gb < 64:
+        return "medium"
+    return "large"
+
+
+def build_labels(hw):
+    best_gpu = "none"
+    for g in hw["gpus"]:
+        if g["vendor"] == "nvidia":
+            best_gpu = "nvidia"
+            break
+        if g["vendor"] in ("amd", "intel") and best_gpu == "none":
+            best_gpu = g["vendor"]
+    data_disks = [d for d in hw["disks"] if not d["boot_media"]]
+    biggest = max((d["size_gb"] for d in data_disks), default=0)
+    labels = {
+        "ark.io/ram-class": ram_class(hw["ram_gb"]),
+        "ark.io/cpu-threads": str(hw["cpu"]["threads"]),
+        "ark.io/avx2": str(hw["cpu"]["avx2"]).lower(),
+        "ark.io/gpu": best_gpu,
+        "ark.io/sdr": str(bool(hw["usb"]["sdr"])).lower(),
+        "ark.io/gps": str(bool(hw["usb"]["gps"])).lower(),
+        "ark.io/serial": str(bool(hw["usb"]["serial"] or hw["tty"])).lower(),
+        "ark.io/data-disks": str(len(data_disks)),
+        "ark.io/disk-class": (
+            "none" if biggest == 0 else "s" if biggest < 500 else "m" if biggest < 4000 else "l"
+        ),
+    }
+    return labels
+
+
+def collect():
+    usb, tty = detect_usb()
+    hw = {
+        "ram_gb": detect_ram_gb(),
+        "cpu": detect_cpu(),
+        "gpus": detect_gpus(),
+        "usb": usb,
+        "tty": tty,
+        "disks": detect_disks(),
+        "uefi": os.path.isdir("/sys/firmware/efi"),
+    }
+    hw["gpu"] = "none"
+    for g in hw["gpus"]:
+        if g["vendor"] == "nvidia":
+            hw["gpu"] = "nvidia"
+            break
+        if g["vendor"] in ("amd", "intel") and hw["gpu"] == "none":
+            hw["gpu"] = g["vendor"]
+    hw["max_data_disk_gb"] = max(
+        (d["size_gb"] for d in hw["disks"] if not d["boot_media"]), default=0
+    )
+    return hw
+
+
+def main(argv):
+    hw = collect()
+    labels = build_labels(hw)
+    if "--print" in argv:
+        json.dump({"hw": hw, "labels": labels}, sys.stdout, indent=2, ensure_ascii=False)
+        print()
+        return 0
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    for name, data in (("hw.json", hw), ("labels.json", labels)):
+        tmp = RUN_DIR / (name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+        os.replace(tmp, RUN_DIR / name)
+    print(
+        f"ark-detect: RAM {hw['ram_gb']} GB, CPU {hw['cpu']['threads']} threads, "
+        f"GPU {hw['gpu']}, SDR {len(hw['usb']['sdr'])}, disks {len(hw['disks'])}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

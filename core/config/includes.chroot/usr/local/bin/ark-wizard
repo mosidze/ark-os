@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+"""ark-wizard: first-boot role selection (web + tty1 banner).
+
+Protected by a one-time token shown on tty1. The result is written to
+<state_dir>/provision.json; later stages (ark-net, ark-k3s) consume it.
+Standard library only.
+"""
+import html
+import hmac
+import http.cookies
+import json
+import os
+import pathlib
+import secrets
+import socket
+import sys
+import time
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, "/usr/local/lib/ark")
+import ark_roles  # noqa: E402
+
+RUN_DIR = pathlib.Path(os.environ.get("ARK_RUN_DIR", "/run/ark"))
+STATE_DIR = pathlib.Path(os.environ.get("ARK_STATE_DIR", "/run/ark"))
+PORT = int(os.environ.get("ARK_WIZARD_PORT", "80"))
+PACKS_DIR = pathlib.Path(os.environ.get("ARK_PACKS_DIR", "/run/ark/packs"))
+
+TOKEN = secrets.token_hex(4).upper()  # 8 hex chars
+SESSIONS = set()
+FAILS = {}  # ip -> (count, window_start)
+MAX_FAILS, WINDOW = 5, 300
+
+
+def load_json(path, default):
+    try:
+        return json.loads(pathlib.Path(path).read_text())
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def available_packs():
+    if not PACKS_DIR.is_dir():
+        return set()
+    return {p.name for p in PACKS_DIR.iterdir() if p.is_dir()}
+
+
+def page(body, title="ARK"):
+    return (
+        "<!doctype html><html lang='ru'><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<title>{html.escape(title)}</title>"
+        "<style>body{font:16px system-ui;max-width:860px;margin:2rem auto;padding:0 1rem}"
+        "td,th{padding:.3rem .6rem;text-align:left;vertical-align:top}"
+        ".ok{color:#1a7f37}.warn{color:#9a6700}.blocked{color:#cf222e}"
+        "code,pre{background:#f3f3f3;padding:.1rem .3rem}</style>"
+        f"<body>{body}</body></html>"
+    )
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "ark-wizard"
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.client_address[0], fmt % args))
+
+    def send(self, code, body, headers=None):
+        data = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def redirect(self, location, headers=None):
+        self.send_response(303)
+        self.send_header("Location", location)
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+
+    def authed(self):
+        cookie = http.cookies.SimpleCookie(self.headers.get("Cookie", ""))
+        morsel = cookie.get("ark_session")
+        return bool(morsel and morsel.value in SESSIONS)
+
+    def read_form(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 64 * 1024:
+            return {}
+        return urllib.parse.parse_qs(self.rfile.read(length).decode(), keep_blank_values=True)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/healthz":
+            return self.send(200, "ok")
+        if path == "/login" or not self.authed():
+            return self.send(200, page(
+                "<h1>ARK: вход</h1><p>Код показан на экране узла (tty1).</p>"
+                "<form method='post' action='/login'>"
+                "<input name='token' autofocus autocomplete='off' maxlength='16'> "
+                "<button>Войти</button></form>"))
+        return self.render_wizard()
+
+    def render_wizard(self):
+        hw = load_json(RUN_DIR / "hw.json", {})
+        if not hw:
+            return self.send(503, page("<p>Детект железа ещё не завершён, обнови страницу.</p>"))
+        catalog = ark_roles.load_catalog()
+        verdict = ark_roles.evaluate_all(catalog, hw, available_packs())
+        rows = []
+        for r in catalog["roles"]:
+            v = verdict[r["id"]]
+            dis = " disabled" if v["status"] == "blocked" else ""
+            chk = " checked" if r["mvp"] and v["status"] == "ok" else ""
+            why = html.escape("; ".join(v["reasons"]))
+            rows.append(
+                f"<tr><td><input type='checkbox' name='role' value='{r['id']}'{dis}{chk}></td>"
+                f"<td><b>{html.escape(r['name'])}</b><br><small>{html.escape(r['stack'])}</small></td>"
+                f"<td class='{v['status']}'>{v['status']}<br><small>{why}</small></td></tr>"
+            )
+        summary = (
+            f"RAM {hw['ram_gb']} ГБ, CPU {hw['cpu']['threads']} потоков, GPU {hw['gpu']}, "
+            f"диск данных до {hw['max_data_disk_gb']} ГБ, SDR {len(hw['usb']['sdr'])}"
+        )
+        body = (
+            f"<h1>ARK: настройка узла {html.escape(socket.gethostname())}</h1>"
+            f"<p><code>{html.escape(summary)}</code></p>"
+            "<form method='post' action='/provision'>"
+            "<h2>Кластер</h2>"
+            "<label><input type='radio' name='cluster' value='new' checked> Создать новый</label><br>"
+            "<label><input type='radio' name='cluster' value='join'> Присоединиться, код: "
+            "<input name='join_code' maxlength='64'></label>"
+            "<h2>Роли узла</h2><table>" + "".join(rows) + "</table>"
+            "<p><button>Применить</button></p></form>"
+        )
+        self.send(200, page(body))
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        ip = self.client_address[0]
+        if path == "/login":
+            return self.login(ip)
+        if not self.authed():
+            return self.send(403, page("<p>Нужен вход.</p>"))
+        if path == "/provision":
+            return self.provision()
+        self.send(404, page("<p>Не найдено.</p>"))
+
+    def login(self, ip):
+        count, start = FAILS.get(ip, (0, time.time()))
+        if time.time() - start > WINDOW:
+            count, start = 0, time.time()
+        if count >= MAX_FAILS:
+            return self.send(429, page("<p>Слишком много попыток, подожди несколько минут.</p>"))
+        form = self.read_form()
+        given = (form.get("token", [""])[0]).strip().upper()
+        if hmac.compare_digest(given.encode(), TOKEN.encode()):
+            sid = secrets.token_urlsafe(24)
+            SESSIONS.add(sid)
+            FAILS.pop(ip, None)
+            return self.redirect(
+                "/", {"Set-Cookie": f"ark_session={sid}; HttpOnly; SameSite=Strict; Path=/"}
+            )
+        FAILS[ip] = (count + 1, start)
+        self.send(401, page("<p>Неверный код.</p><p><a href='/login'>Ещё раз</a></p>"))
+
+    def provision(self):
+        form = self.read_form()
+        hw = load_json(RUN_DIR / "hw.json", {})
+        catalog = ark_roles.load_catalog()
+        verdict = ark_roles.evaluate_all(catalog, hw, available_packs())
+        roles = [r for r in form.get("role", []) if r in verdict and verdict[r]["status"] != "blocked"]
+        cluster = form.get("cluster", ["new"])[0]
+        join_code = form.get("join_code", [""])[0].strip()
+        if cluster not in ("new", "join") or (cluster == "join" and not join_code):
+            return self.send(400, page("<p>Для присоединения нужен код кластера.</p>"))
+        result = {
+            "hostname": socket.gethostname(),
+            "cluster": cluster,
+            "join_code": join_code if cluster == "join" else None,
+            "roles": roles,
+            "labels": load_json(RUN_DIR / "labels.json", {}),
+            "created": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_DIR / "provision.json.tmp"
+        tmp.write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
+        os.replace(tmp, STATE_DIR / "provision.json")
+        self.send(200, page(
+            "<h1>Принято</h1><p>Роли: " + html.escape(", ".join(roles) or "нет")
+            + "</p><p>Узел применяет настройки.</p>"))
+
+
+class DualStackServer(ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
+
+
+def make_server():
+    try:
+        return DualStackServer(("::", PORT), Handler)
+    except OSError:  # no IPv6 in this kernel/container
+        return ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+
+
+def banner():
+    host = socket.gethostname()
+    line = "=" * 56
+    print(f"\n{line}\n  ARK: узел не настроен\n  Открой в браузере: http://{host}.local/\n"
+          f"  Код входа: {TOKEN}\n{line}\n", flush=True)
+
+
+def main():
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    (RUN_DIR / "wizard.token").write_text(TOKEN + "\n")
+    os.chmod(RUN_DIR / "wizard.token", 0o600)
+    if (STATE_DIR / "provision.json").exists():
+        print("ark-wizard: узел уже настроен, мастер не нужен", flush=True)
+        return 0
+    banner()
+    make_server().serve_forever()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,32 @@
+#!/bin/sh
+# Runs inside the chroot at build time.
+set -e
+
+# 1. k3s binary and airgap images (fetched by tools/fetch-vendor.sh)
+if [ ! -x /opt/ark-vendor/k3s ]; then
+    echo "ERROR: /opt/ark-vendor/k3s missing. Run tools/fetch-vendor.sh before building." >&2
+    exit 1
+fi
+install -m 0755 /opt/ark-vendor/k3s /usr/local/bin/k3s
+mkdir -p /var/lib/rancher/k3s/agent/images
+for f in /opt/ark-vendor/k3s-airgap-images-amd64.tar.*; do
+    [ -e "$f" ] && cp "$f" /var/lib/rancher/k3s/agent/images/
+done
+rm -rf /opt/ark-vendor
+
+# 2. Helper scripts executable
+chmod 0755 /usr/local/lib/ark/ark-detect /usr/local/bin/ark-wizard
+
+# 3. Services: our units on, defaults that conflict or phone home off
+systemctl enable ark-detect.service ark-wizard.service
+systemctl enable systemd-networkd.service systemd-resolved.service avahi-daemon.service ssh.service
+systemctl disable dnsmasq.service chrony.service gpsd.service 2>/dev/null || true
+systemctl mask getty@tty1.service
+systemctl mask apt-daily.timer apt-daily-upgrade.timer motd-news.timer 2>/dev/null || true
+
+# 4. Air-gap: no apt on a deployed node, no repositories to reach
+rm -f /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
+rm -rf /var/lib/apt/lists/*
+
+# 5. resolv.conf via resolved stub
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf

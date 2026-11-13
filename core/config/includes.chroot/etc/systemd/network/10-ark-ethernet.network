@@ -1,0 +1,13 @@
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=ipv4
+# Без DHCP-сервера в сети узел всё равно достижим по link-local + mDNS (avahi).
+LinkLocalAddressing=ipv4
+MulticastDNS=no
+IPv6AcceptRA=yes
+
+[DHCPv4]
+UseDNS=yes
+RouteMetric=100

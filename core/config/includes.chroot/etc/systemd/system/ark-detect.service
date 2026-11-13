@@ -1,0 +1,13 @@
+[Unit]
+Description=ARK hardware detection
+After=local-fs.target systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=ark-wizard.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/ark/ark-detect
+
+[Install]
+WantedBy=multi-user.target
